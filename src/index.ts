@@ -259,7 +259,7 @@ export async function runMcp2025ComplianceAudit(targetUrl: string): Promise<Comp
     return { passed: res.status === 403 && body?.id === null && !!body?.error, statusCode: res.status, details: `Untrusted origin returned ${res.status}` };
   });
   await check('initialize', 'Initialize Handshake & 2025-11-25 Negotiation', 'Lifecycle / Initialization', async () => {
-    const res = await request('POST', rpc(2, 'initialize', { protocolVersion: MCP_2025_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'alexa-mcp-2025-kit-auditor', version: '0.1.0' } }));
+    const res = await request('POST', rpc(2, 'initialize', { protocolVersion: MCP_2025_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'alexa-mcp-2025-kit-auditor', version: '1.0.0' } }));
     sessionId = res.headers.get('mcp-session-id') ?? '';
     const body = await res.json();
     return { passed: res.ok && body?.jsonrpc === '2.0' && body?.id === 2 && body?.result?.protocolVersion === MCP_2025_PROTOCOL_VERSION,
@@ -294,10 +294,18 @@ export async function runMcp2025ComplianceAudit(targetUrl: string): Promise<Comp
       await first.body?.cancel(); return { passed: false, statusCode: first.status, details: `GET returned ${first.status} without SSE` };
     }
     const reader = first.body?.getReader();
-    const chunk = reader ? await Promise.race([reader.read(), new Promise<never>((_, reject) => setTimeout(() => reject(new Error('SSE priming timed out')), 3000))]) : null;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let chunk: ReadableStreamReadResult<Uint8Array> | null = null;
+    try {
+      chunk = reader ? await Promise.race([reader.read(), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('SSE priming timed out')), 3000);
+      })]) : null;
+    } finally {
+      if (timer) clearTimeout(timer);
+      await reader?.cancel();
+    }
     const text = chunk?.value ? new TextDecoder().decode(chunk.value) : '';
     const eventId = /^id: ([^\r\n]+)/m.exec(text)?.[1];
-    await reader?.cancel();
     if (!eventId) return { passed: false, statusCode: first.status, details: 'SSE opened but no priming event ID was received' };
     const resumed = await request('GET', undefined, { ...sseHeaders, 'Last-Event-ID': eventId });
     const passed = resumed.ok && !!resumed.headers.get('content-type')?.includes('text/event-stream');

@@ -1,71 +1,128 @@
 # alexa-mcp-2025-kit
 
-[![MIT License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![MCP](https://img.shields.io/badge/MCP-2025--11--25-8b5cf6)](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6)](tsconfig.json) [![Tests](https://img.shields.io/badge/compliance-8%2F8-brightgreen)](tests/compliance.test.ts)
 
-A standalone TypeScript/Node toolkit for the **Build, Ship, Shape: Amazon Developer Hackathon** open-source mini-challenge. It pairs with the [EchoCare Kinship Alexa+ application](https://github.com/FEMZYKENTLTD/echocare-kinship-alexa-mcp), but has no dependency on that repository.
+**A standalone, open-source TypeScript toolkit for MCP 2025-11-25 Streamable HTTP, Alexa+ MCP Apps, Agent Skills, and live compliance testing.** Built for the **Build, Ship, Shape: Amazon Developer Hackathon** open-source mini-challenge, alongside the [EchoCare Kinship Alexa+ primary project](https://github.com/FEMZYKENTLTD/echocare-kinship-alexa-mcp). [Submission notes for judges](OPEN_SOURCE_SUBMISSION.md).
 
-**What:** an MCP `2025-11-25` Streamable HTTP guard and session/event manager, a typed Alexa MCP App tool definition, an Agent Skill `SKILL.md` parser, and an eight-check live endpoint auditor. **Why:** make transport security and interoperable `ui://`/skill integration testable independently of any one Alexa+ app. **How:** mount the guard on a single `/mcp` endpoint, implement JSON-RPC dispatch in your server, and run the auditor against the running endpoint.
+The toolkit supplies a session-aware Express/Node guard, `ui://` tool definitions, a `SKILL.md` YAML/Markdown parser, a reference server with status dashboard, and an eight-check compliance auditor. Separating these primitives from a single application makes transport regressions, DNS-rebinding protections, and UI metadata independently reproducible.
 
-> This is a transport *guard*, not a complete MCP SDK or authentication solution. The application must implement `initialize`, tools, resources, JSON-RPC error handling, and production authentication. SSE history is in-memory (last 1,000 events per session); multi-instance deployments need shared state. `*.e2b.app` is allowed by default for development previews; **supply an explicit `allowedOrigins` list in production**.
+## Architecture
 
-## Install and test
-
-```sh
-npm install
-npm test
-npm run build
-node examples/server.mjs
+```text
+┌─────────────────────────────── client / Alexa+ host ───────────────────────────────┐
+│ POST initialize · JSON-RPC requests/notifications · GET SSE · DELETE session       │
+└─────────────────────────────────┬───────────────────────────────────────────────────┘
+                                  ▼
+                        single /mcp endpoint
+                  ┌──────────────────────────────┐
+                  │ origin + protocol guard      │
+                  │ UUID sessions + event replay │◀── Last-Event-ID
+                  └──────────────┬───────────────┘
+                                 ▼
+       ┌─────────────────────────┴──────────────────────────┐
+       │ application JSON-RPC dispatcher / reference server │
+       └───────────┬───────────────────────────┬────────────┘
+                   ▼                           ▼
+         typed MCP tool + ui://           SKILL.md manifest
+         resources/read + tools/list      YAML + instructions
+                   └───────────┬───────────────┘
+                               ▼
+                   CLI / live 8-check auditor
 ```
 
-Node.js 20+ is required. Published-package consumers can import from `alexa-mcp-2025-kit`; this repository's local example imports `../dist/index.js` after building. Type declarations are emitted to `dist/index.d.ts`.
+## Install, run, verify
 
-## Streamable HTTP usage
+Requires Node.js **20+**.
+
+```bash
+npm install
+npm run build
+npm test                         # 13 Vitest tests, including all eight protocol checks
+npm run demo-audit               # ephemeral self-test; prints table + JSON, exits 0 on 8/8
+npm run reference-server         # dashboard: http://localhost:3001/; MCP: /mcp
+```
+
+After publishing, use `npx alexa-mcp-2025-kit selftest` or `npx alexa-mcp-2025-kit audit https://your-host.example/mcp`. To exercise this checkout without publishing, run `node dist/cli.js selftest` after building. `audit` without a URL also starts an ephemeral local reference server. The reference server example binds `0.0.0.0:3001` for dashboards; the CLI's temporary self-test server binds `127.0.0.1` on an OS-assigned port and shuts down automatically.
+
+**Typical CLI output** (URL and timings vary):
+
+```text
+Started ephemeral reference server at http://127.0.0.1:PORT/mcp
+MCP 2025-11-25 compliance audit: http://127.0.0.1:PORT/mcp
+Score: 8/8 (100%) | Total latency: 71 ms
+Result    Check                                               HTTP   Latency
+PASS      Origin Security Guard                               403    38 ms
+PASS      Initialize Handshake & 2025-11-25 Negotiation       200     6 ms
+PASS      MCP-Session-Id Issuance & ASCII Validation          —       0 ms
+PASS      Invalid MCP-Protocol-Version Rejection              400     3 ms
+PASS      Notification 202 Accepted Handling                  202     2 ms
+PASS      tools/list & ui:// MCP App Metadata Verification    200     3 ms
+PASS      SSE Stream & Last-Event-ID Resumption Support       200    14 ms
+PASS      Session Termination via HTTP DELETE                 204     5 ms
+
+JSON report:
+{ "targetUrl": "http://127.0.0.1:PORT/mcp", "protocolVersion": "2025-11-25",
+  "overallPassed": true, "score": "8/8 (100%)", "checks": [ ... ] }
+```
+
+A failed check exits 1; invalid CLI syntax exits 2. The full JSON report includes ISO timestamp, latency, status codes, per-check spec sections, and diagnostic details. Auditing sends initialize/DELETE requests: **only probe endpoints you own or have permission to test**.
+
+## Public API reference (`src/index.ts`)
+
+| Export | Role |
+| --- | --- |
+| `MCP_2025_PROTOCOL_VERSION`, `LEGACY_PROTOCOL_VERSION` | `2025-11-25`, `2025-03-26` |
+| `createStreamableHttp2025Guard(options?)` | `{ middleware, createSession, hasSession, terminateSession, recordSseEvent, getEventsAfter }` |
+| `defineAlexaMcpAppTool<TInput,TOutput>(definition)` | Validate and retain typed `ui://` tool definition and async handler |
+| `parseAgentSkillMarkdown(markdownContent)` | Validate YAML frontmatter and instructions; return `AgentSkillManifest` |
+| `loadAgentSkillManifest(filePath)` | Read and parse a `SKILL.md` file |
+| `runMcp2025ComplianceAudit(targetUrl)` | Return `Promise<ComplianceAuditReport>` with eight checks |
+
+Types exported: `StreamableHttp2025Options`, `AlexaMcpUiResourceMeta`, `AlexaMcpToolDefinition`, `AgentSkillManifest`, `ComplianceCheckItem`, `ComplianceAuditReport`. ESM import and `.d.ts` declarations are provided by `dist/` after build. Package dependencies include the official `@modelcontextprotocol/sdk` (used to type the reference server's `Tool` and `CallToolResult`), Express, and YAML; development tooling includes tsx, Vitest, and TypeScript.
+
+### Guard and sessions
 
 ```ts
+import express from 'express';
 import { createStreamableHttp2025Guard, MCP_2025_PROTOCOL_VERSION } from 'alexa-mcp-2025-kit';
-
+const app = express();
 const guard = createStreamableHttp2025Guard({
-  allowedOrigins: ['https://your-app.example', 'http://localhost:3000'],
-  requireSessionId: true,
+  allowedOrigins: ['https://your-app.example', 'http://localhost:3001'],
+  requireSessionId: true, supportedVersions: [MCP_2025_PROTOCOL_VERSION, '2025-03-26'],
   enableSseResumption: true
 });
-// Express: app.use('/mcp', express.json(), guard.middleware);
-// Then app.post('/mcp', yourJsonRpcHandler). For initialize, return an
-// InitializeResult with protocolVersion: MCP_2025_PROTOCOL_VERSION.
-// The guard provides req.mcpSessionId and req.mcpProtocolVersion to the handler.
+app.use('/mcp', express.json(), guard.middleware);
+app.post('/mcp', (req, res) => {
+  // Implement JSON-RPC dispatch; send InitializeResult for initialize.
+  // req.mcpSessionId and req.mcpProtocolVersion are available here.
+});
 ```
 
-See [`examples/server.mjs`](examples/server.mjs) for a runnable Node HTTP server with `initialize`, `tools/list`, `tools/call`, `resources/list`, and `resources/read`. The guard checks `Origin` before any other MCP logic, rejects unsupported `MCP-Protocol-Version` (omitted means `2025-03-26`), creates UUID sessions on initialization, rejects missing/terminated sessions, accepts notifications and responses with `202`/no body, serves GET SSE, and terminates sessions on DELETE. It does **not** change your POST request handler's JSON response into SSE automatically. Send `Content-Type: application/json` or implement a POST SSE response yourself; use `recordSseEvent()` to assign sequential `<streamId>:<sequence>` IDs, obtain formatted frames and publish them to active GET listeners. `getEventsAfter(sessionId, lastEventId)` returns buffered frames following a known ID (unknown/evicted IDs return `[]`). GET sends a priming event with an ID and empty data and replays buffered events when given `Last-Event-ID`.
+The guard checks incoming Origin (`403` JSON-RPC error with `id: null` for untrusted origins), supports POST/GET/DELETE, validates version (`400` for unsupported; omitted means legacy), issues a visible-ASCII UUID on initialize, enforces sessions (`400` missing / `404` terminated), and answers notifications/responses `202` without a body. GET opens an SSE stream with a priming event ID; `recordSseEvent(sessionId, eventName, payload)` publishes events with `<streamId>:<sequence>` IDs, and `getEventsAfter(sessionId, lastEventId)` returns buffered frames. DELETE returns `204` and terminates the session. The application dispatches JSON-RPC requests and can reply to POST with JSON **or** implement POST SSE (using the event helper); the guard does not convert JSON handlers into POST SSE automatically. See [`src/reference-server.ts`](src/reference-server.ts) for full JSON-RPC dispatch and [`examples/reference-server.ts`](examples/reference-server.ts) for its runnable launcher.
 
-Mount body parsing **before** the middleware: it needs `req.body` to distinguish initialize/notifications from ordinary requests. Mount only on `/mcp`. Sessions and replay data live in this guard instance; if your load balancer routes requests to another instance, use sticky sessions or replace the in-memory storage with shared persistence. Validate authorizations separately from Origin checks. `supportedVersions` defaults to `['2025-11-25', '2025-03-26']`; a custom list controls accepted headers. The application's initialize handler must negotiate the version in its InitializeResult.
+**Deployment limits:** the default Origin allowlist includes `localhost`, `127.0.0.1`, and `*.e2b.app` for local development; explicitly set your own allowlist in production. Origin validation is not user authentication. Mount JSON body parsing before the guard; the parser must classify initialize and notifications. Keep requests for a session on one instance, or implement shared storage: this guard stores active sessions and the most recent 1,000 SSE frames **in memory**. Unknown or evicted Last-Event-ID values do not replay old frames. The application's initialize handler is responsible for negotiating its `InitializeResult` and for authorization, JSON-RPC errors, and resource rendering.
 
-## Typed MCP Apps and Agent Skills
+### MCP App tools and Agent Skills
 
 ```ts
 import { defineAlexaMcpAppTool, loadAgentSkillManifest } from 'alexa-mcp-2025-kit';
-
 const tool = defineAlexaMcpAppTool<{ label: string }, { message: string }>({
   name: 'show_status', description: 'Show status',
   inputSchema: { type: 'object', properties: { label: { type: 'string' } }, required: ['label'] },
-  uiResource: { uri: 'ui://status/card', title: 'Status', description: 'Status UI' },
+  uiResource: { uri: 'ui://status/card', title: 'Status', description: 'Status UI', aspectRatio: '4:3' },
   handler: async ({ label }, { sessionId }) => ({ message: `${label} (${sessionId})` })
 });
-// Advertise { _meta: { ui: { resourceUri: tool.uiResource.uri } } }
-// in tools/list and serve its HTML through resources/read.
+// Expose { _meta: { ui: { resourceUri: tool.uiResource.uri } } } in tools/list.
+// Serve matching HTML with resources/list and resources/read.
 const skill = loadAgentSkillManifest('examples/SKILL.md');
 ```
 
-The helper validates the definition and preserves its original generic types and handler; it does not register the tool on a server. The parser expects `name`, `description`, `version`, `mcpSpecVersion`, `triggers`, `tools`, `uiResources` in YAML frontmatter and non-empty Markdown instructions. See [`examples/SKILL.md`](examples/SKILL.md). The `ui://` metadata key for MCP Apps is `_meta.ui.resourceUri`.
+The helper validates the definition but **does not automatically register it** on a server. The parser requires `name`, `description`, `version`, `mcpSpecVersion`, `triggers`, `tools`, and `uiResources` frontmatter and nonempty Markdown instructions. See [`examples/SKILL.md`](examples/SKILL.md).
 
-## Live compliance audit
+### Audit scope
 
-```js
-import { runMcp2025ComplianceAudit } from 'alexa-mcp-2025-kit';
-console.log(JSON.stringify(await runMcp2025ComplianceAudit('http://127.0.0.1:3000/mcp'), null, 2));
-```
-
-The report provides `overallPassed`, `score`, timings and eight detailed checks: untrusted Origin 403; initialize/version; session UUID/ASCII; invalid version 400; notification 202; `tools/list` UI metadata; GET SSE priming and reconnection with `Last-Event-ID`; DELETE and subsequent 404. Network failures become failed checks rather than crashing the report. The auditor **does not prove missed-event redelivery** without an independently injected event; use `recordSseEvent` plus `getEventsAfter` or an integration test to verify actual replay (the test suite does this). Only audit endpoints you own or have permission to probe; it sends state-changing initialize/DELETE requests.
+The auditor checks: (1) Origin 403, (2) initialize/version negotiation, (3) session ASCII/UUID, (4) invalid version 400, (5) notification 202, (6) UI metadata in `tools/list`, (7) GET SSE priming plus reconnection with Last-Event-ID, and (8) DELETE then 404. **Check 7 tests reconnection, not proof of missed-event redelivery** on an arbitrary remote server: it cannot manufacture server-push messages there. The unit test additionally verifies actual buffered event replay using `recordSseEvent`/`getEventsAfter`. Network errors become failed checks, not an aborted audit.
 
 ## License
 
-[MIT](LICENSE). Copyright (c) 2026 OLUFEMI BENUA KERIPE.
+[MIT](LICENSE) © 2026 OLUFEMI BENUA KERIPE. The root LICENSE is the standard MIT text for GitHub detection.
