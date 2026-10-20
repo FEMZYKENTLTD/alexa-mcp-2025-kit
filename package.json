@@ -19,10 +19,12 @@
     "dist",
     "README.md",
     "OPEN_SOURCE_SUBMISSION.md",
+    "SECURITY.md",
     "LICENSE"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "prepack": "npm run build",
     "test": "npm run build && vitest run",
     "demo-audit": "npm run build && node dist/cli.js selftest",
     "reference-server": "tsx examples/reference-server.ts",
@@ -38,7 +40,7 @@
     "@types/node": "^22.15.0",
     "tsx": "^4.20.0",
     "typescript": "^5.9.3",
-    "vitest": "^3.2.4"
+    "vitest": "^4.1.12"
   },
   "repository": "https://github.com/FEMZYKENTLTD/alexa-mcp-2025-kit",
   "bin": {

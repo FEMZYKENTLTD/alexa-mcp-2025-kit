@@ -3,6 +3,8 @@ import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createServer } from 'node:http';
+import { once } from 'node:events';
 import { createStreamableHttp2025Guard, defineAlexaMcpAppTool, loadAgentSkillManifest,
   parseAgentSkillMarkdown, runMcp2025ComplianceAudit, MCP_2025_PROTOCOL_VERSION,
   LEGACY_PROTOCOL_VERSION } from '../src/index.js';
@@ -31,6 +33,28 @@ describe('MCP 2025-11-25 reference endpoint', () => {
       expect(res.status).toBe(403);
       expect(await res.json()).toMatchObject({ jsonrpc: '2.0', id: null, error: { message: 'Forbidden Origin' } });
     }
+  });
+  it('rejects untrusted Origins before JSON parsing, and returns JSON-RPC errors for malformed trusted input', async () => {
+    const attack = await fetch(reference.url, {
+      method: 'POST', headers: { Origin: 'https://evil.invalid', 'Content-Type': 'application/json' }, body: '{bad json'
+    });
+    expect(attack.status).toBe(403);
+    expect((await attack.json()).id).toBeNull();
+    for (const method of ['GET', 'DELETE']) {
+      const blocked = await fetch(reference.url, { method, headers: { Origin: 'https://evil.invalid', Accept: 'text/event-stream' } });
+      expect(blocked.status).toBe(403);
+      expect((await blocked.json()).id).toBeNull();
+    }
+    const invalid = await fetch(reference.url, {
+      method: 'POST', headers: { Origin: 'http://localhost:3001', 'Content-Type': 'application/json' }, body: '{bad json'
+    });
+    expect(invalid.status).toBe(400);
+    expect((await invalid.json()).id).toBeNull();
+  });
+  it('does not issue a session on an unsuccessful initialize response', async () => {
+    const res = await post(reference.url, rpc(1, 'initialize', { protocolVersion: 'unsupported' }));
+    expect(res.status).toBe(400);
+    expect(res.headers.get('mcp-session-id')).toBeNull();
   });
   it('2. negotiates protocol 2025-11-25 during initialize', async () => {
     const res = await post(reference.url, init);
@@ -116,6 +140,58 @@ describe('API helpers', () => {
     expect(guard.getEventsAfter(id, one.id)).toEqual([two.formatted]);
     expect(guard.terminateSession(id)).toBe(true);
     expect(guard.hasSession(id)).toBe(false);
+  });
+  it('does not leak sessions for JSON-RPC error results returned with HTTP 200', async () => {
+    const guard = createStreamableHttp2025Guard();
+    const server = createServer(async (req, res) => {
+      let body = '';
+      for await (const part of req) body += part;
+      req.body = JSON.parse(body);
+      guard.middleware(req, res, () => {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: req.body.id, error: { code: -32602, message: 'Nope' } })));
+      });
+    });
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    try {
+      const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`;
+      const result = await post(url, init);
+      expect(result.status).toBe(200);
+      expect(result.headers.get('mcp-session-id')).toBeNull();
+      expect((await result.json()).error.code).toBe(-32602);
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
+  });
+  it('redelivers missed JSON-RPC events over a real resumed HTTP SSE connection', async () => {
+    const guard = createStreamableHttp2025Guard();
+    const id = guard.createSession();
+    const server = createServer((req, res) => guard.middleware(req, res, () => res.end()));
+    server.listen(0, '127.0.0.1');
+    await once(server, 'listening');
+    const url = `http://127.0.0.1:${(server.address() as { port: number }).port}/mcp`;
+    try {
+      const headers = { Accept: 'text/event-stream', 'MCP-Session-Id': id };
+      const initial = await fetch(url, { headers });
+      const reader = initial.body!.getReader();
+      const prime = new TextDecoder().decode((await reader.read()).value);
+      const lastId = /^id: ([^\r\n]+)/m.exec(prime)?.[1];
+      expect(lastId).toMatch(/:[0-9]+$/);
+      await reader.cancel();
+      const missed = guard.recordSseEvent(id, 'message', { jsonrpc: '2.0', method: 'notifications/progress' });
+      const resumed = await fetch(url, { headers: { ...headers, 'Last-Event-ID': lastId! } });
+      const resumedReader = resumed.body!.getReader();
+      const frame = new TextDecoder().decode((await resumedReader.read()).value);
+      expect(frame).toContain(`id: ${missed.id}`);
+      expect(frame).toContain('notifications/progress');
+      await resumedReader.cancel();
+    } finally {
+      guard.terminateSession(id);
+      server.closeAllConnections();
+      await new Promise<void>(resolve => server.close(() => resolve()));
+    }
   });
   it('preserves generic input/output handler and rejects invalid UI metadata', async () => {
     const tool = defineAlexaMcpAppTool<{ label: string }, string>({

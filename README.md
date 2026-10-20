@@ -1,6 +1,6 @@
 # alexa-mcp-2025-kit
 
-[![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![MCP](https://img.shields.io/badge/MCP-2025--11--25-8b5cf6)](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6)](tsconfig.json) [![Tests](https://img.shields.io/badge/compliance-8%2F8-brightgreen)](tests/compliance.test.ts)
+[![CI](https://github.com/FEMZYKENTLTD/alexa-mcp-2025-kit/actions/workflows/ci.yml/badge.svg)](https://github.com/FEMZYKENTLTD/alexa-mcp-2025-kit/actions/workflows/ci.yml) [![MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE) [![MCP](https://img.shields.io/badge/MCP-2025--11--25-8b5cf6)](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#streamable-http) [![TypeScript](https://img.shields.io/badge/TypeScript-strict-3178c6)](tsconfig.json) [![Tests](https://img.shields.io/badge/compliance-8%2F8-brightgreen)](tests/compliance.test.ts)
 
 **A standalone, open-source TypeScript toolkit for MCP 2025-11-25 Streamable HTTP, Alexa+ MCP Apps, Agent Skills, and live compliance testing.** Built for the **Build, Ship, Shape: Amazon Developer Hackathon** open-source mini-challenge, alongside the [EchoCare Kinship Alexa+ primary project](https://github.com/FEMZYKENTLTD/echocare-kinship-alexa-mcp). [Submission notes for judges](OPEN_SOURCE_SUBMISSION.md).
 
@@ -37,7 +37,7 @@ Requires Node.js **20+**.
 ```bash
 npm install
 npm run build
-npm test                         # 13 Vitest tests, including all eight protocol checks
+npm test                         # 17 Vitest tests, including all eight protocol checks
 npm run demo-audit               # ephemeral self-test; prints table + JSON, exits 0 on 8/8
 npm run reference-server         # dashboard: http://localhost:3001/; MCP: /mcp
 ```
@@ -78,7 +78,7 @@ A failed check exits 1; invalid CLI syntax exits 2. The full JSON report include
 | `loadAgentSkillManifest(filePath)` | Read and parse a `SKILL.md` file |
 | `runMcp2025ComplianceAudit(targetUrl)` | Return `Promise<ComplianceAuditReport>` with eight checks |
 
-Types exported: `StreamableHttp2025Options`, `AlexaMcpUiResourceMeta`, `AlexaMcpToolDefinition`, `AgentSkillManifest`, `ComplianceCheckItem`, `ComplianceAuditReport`. ESM import and `.d.ts` declarations are provided by `dist/` after build. Package dependencies include the official `@modelcontextprotocol/sdk` (used to type the reference server's `Tool` and `CallToolResult`), Express, and YAML; development tooling includes tsx, Vitest, and TypeScript.
+Types exported: `StreamableHttp2025Options`, `AlexaMcpUiResourceMeta`, `AlexaMcpToolDefinition`, `AgentSkillManifest`, `ComplianceCheckItem`, `ComplianceAuditReport`. ESM import and `.d.ts` declarations are provided by `dist/` after build; `prepack` also builds them automatically for `npm pack`/publish. Package dependencies include the official `@modelcontextprotocol/sdk` (used to type the reference server's `Tool` and `CallToolResult`), Express, and YAML; development tooling includes tsx, Vitest, and TypeScript.
 
 ### Guard and sessions
 
@@ -100,7 +100,7 @@ app.post('/mcp', (req, res) => {
 
 The guard checks incoming Origin (`403` JSON-RPC error with `id: null` for untrusted origins), supports POST/GET/DELETE, validates version (`400` for unsupported; omitted means legacy), issues a visible-ASCII UUID on initialize, enforces sessions (`400` missing / `404` terminated), and answers notifications/responses `202` without a body. GET opens an SSE stream with a priming event ID; `recordSseEvent(sessionId, eventName, payload)` publishes events with `<streamId>:<sequence>` IDs, and `getEventsAfter(sessionId, lastEventId)` returns buffered frames. DELETE returns `204` and terminates the session. The application dispatches JSON-RPC requests and can reply to POST with JSON **or** implement POST SSE (using the event helper); the guard does not convert JSON handlers into POST SSE automatically. See [`src/reference-server.ts`](src/reference-server.ts) for full JSON-RPC dispatch and [`examples/reference-server.ts`](examples/reference-server.ts) for its runnable launcher.
 
-**Deployment limits:** the default Origin allowlist includes `localhost`, `127.0.0.1`, and `*.e2b.app` for local development; explicitly set your own allowlist in production. Origin validation is not user authentication. Mount JSON body parsing before the guard; the parser must classify initialize and notifications. Keep requests for a session on one instance, or implement shared storage: this guard stores active sessions and the most recent 1,000 SSE frames **in memory**. Unknown or evicted Last-Event-ID values do not replay old frames. The application's initialize handler is responsible for negotiating its `InitializeResult` and for authorization, JSON-RPC errors, and resource rendering.
+**Deployment limits:** the default Origin allowlist includes `localhost`, `127.0.0.1`, and `*.e2b.app` for local development; explicitly set your own allowlist in production. Origin validation is not user authentication. Mount JSON body parsing before the guard; the parser must classify initialize and notifications. Because a body parser may reject malformed JSON before calling the guard, put a matching **Origin preflight gate before parsing** (as in `src/reference-server.ts`) to guarantee 403 for untrusted Origins even on malformed requests. The reference server returns JSON-RPC errors for trusted malformed requests. Keep requests for a session on one instance, or implement shared storage: this guard stores active sessions and the most recent 1,000 SSE frames **in memory**. Unknown or evicted Last-Event-ID values do not replay old frames. The application's initialize handler is responsible for negotiating its `InitializeResult` and for authorization, JSON-RPC errors, and resource rendering.
 
 ### MCP App tools and Agent Skills
 
@@ -122,6 +122,10 @@ The helper validates the definition but **does not automatically register it** o
 ### Audit scope
 
 The auditor checks: (1) Origin 403, (2) initialize/version negotiation, (3) session ASCII/UUID, (4) invalid version 400, (5) notification 202, (6) UI metadata in `tools/list`, (7) GET SSE priming plus reconnection with Last-Event-ID, and (8) DELETE then 404. **Check 7 tests reconnection, not proof of missed-event redelivery** on an arbitrary remote server: it cannot manufacture server-push messages there. The unit test additionally verifies actual buffered event replay using `recordSseEvent`/`getEventsAfter`. Network errors become failed checks, not an aborted audit.
+
+## Continuous verification and security
+
+CI runs `npm ci`, build, all tests, the 8/8 demo, npm audit, and a package dry-run on Node 20 and 22. Development dependencies were updated to Vitest 4 to resolve critical and moderate npm audit findings while retaining Node 20 support. See [SECURITY.md](SECURITY.md) for responsible disclosure and production boundaries.
 
 ## License
 

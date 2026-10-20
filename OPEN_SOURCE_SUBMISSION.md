@@ -28,4 +28,4 @@ npm run demo-audit
 npm run reference-server   # open http://localhost:3001/
 ```
 
-The eight checks and additional parser/UI/session tests are in [`tests/compliance.test.ts`](tests/compliance.test.ts). [`README.md`](README.md) includes an architecture diagram, API reference, usage examples, limits, and sample CLI output. The reference server's MCP tool metadata points to a real `ui://status/card` resource served by `resources/read`. The auditor's SSE check confirms priming and reconnection; replay is additionally tested in the event-manager tests.
+The eight checks and additional security, parser/UI/session, and real HTTP SSE replay tests are in [`tests/compliance.test.ts`](tests/compliance.test.ts). [`README.md`](README.md) includes an architecture diagram, API reference, usage examples, limits, and sample CLI output. The reference server's MCP tool metadata points to a real `ui://status/card` resource served by `resources/read`. The auditor's SSE check confirms priming and reconnection; replay is additionally tested in the event-manager tests.
