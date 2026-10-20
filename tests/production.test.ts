@@ -161,6 +161,28 @@ describe.skipIf(!redisUrl)('real Redis cross-instance and TTL integration', () =
       const event = await a.append(id, 'message', { jsonrpc: '2.0', id: 1, result: {} });
       expect(await pushed).toEqual(event);
       expect(await b.eventsAfter(id, prime.id)).toEqual([event]);
+      const endpointA = await serve(a);
+      const endpointB = await serve(b);
+      try {
+        const started = await post(endpointA.url, init, 'alice');
+        const sharedId = started.headers.get('mcp-session-id')!;
+        expect(sharedId).toBeTruthy();
+        const headers = { Authorization: 'Bearer alice', Accept: 'text/event-stream', 'MCP-Session-Id': sharedId };
+        const stream = await fetch(endpointB.url, { headers });
+        const reader = stream.body!.getReader();
+        const first = new TextDecoder().decode((await reader.read()).value);
+        const lastId = /^id: ([^\r\n]+)/m.exec(first)?.[1];
+        expect(lastId).toBeTruthy();
+        const published = await a.append(sharedId, 'message', { jsonrpc: '2.0', method: 'notifications/progress' });
+        expect(new TextDecoder().decode((await reader.read()).value)).toContain(published.id);
+        await reader.cancel();
+        const resumed = await fetch(endpointA.url, { headers: { ...headers, 'Last-Event-ID': lastId! } });
+        const resumedReader = resumed.body!.getReader();
+        expect(new TextDecoder().decode((await resumedReader.read()).value)).toContain(published.id);
+        await resumedReader.cancel();
+        expect((await fetch(endpointB.url, { method: 'DELETE', headers })).status).toBe(204);
+        expect((await post(endpointA.url, { jsonrpc: '2.0', id: 9, method: 'ping' }, 'alice', sharedId)).status).toBe(404);
+      } finally { await endpointA.close(); await endpointB.close(); }
       await new Promise(resolve => setTimeout(resolve, 2300));
       expect(await b.get(id)).toBeNull();
       await expect(a.append(id, 'message', {})).rejects.toThrow();
