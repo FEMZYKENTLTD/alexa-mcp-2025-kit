@@ -16,6 +16,12 @@ export interface RedisSessionClient {
 import { jsonRpcHttpError, originAllowed } from './http-security.js';
 import { LEGACY_PROTOCOL_VERSION, MCP_2025_PROTOCOL_VERSION, type StreamableHttp2025Options } from './index.js';
 
+export interface AuthenticatedMcpIdentity {
+  subject: string;
+  scopes?: string[];
+  clientId?: string;
+  expiresAtMs?: number;
+}
 export interface SessionRecord { subject: string; protocolVersion: string; streamId: string; expiresAtMs?: number }
 export interface StoredEvent { id: string; formatted: string }
 export type SessionMessage = StoredEvent | { terminated: true };
@@ -123,7 +129,7 @@ export class RedisSessionStore implements SharedSessionStore {
 
 export interface JwksAuthOptions { jwksUrl: string; issuer: string; audience: string }
 /** Verifies signed OIDC JWTs, issuer, audience, expiry and subject. Never accepts unsigned tokens. */
-export function createJwksAuthenticator(options: JwksAuthOptions): (token: string) => Promise<{ subject: string; expiresAtMs?: number } | null> {
+export function createJwksAuthenticator(options: JwksAuthOptions): (token: string) => Promise<AuthenticatedMcpIdentity | null> {
   const url = new URL(options.jwksUrl);
   if (url.protocol !== 'https:' && !(url.protocol === 'http:' && ['localhost', '127.0.0.1'].includes(url.hostname)))
     throw new Error('JWKS must use HTTPS (or localhost HTTP for tests)');
@@ -132,15 +138,26 @@ export function createJwksAuthenticator(options: JwksAuthOptions): (token: strin
   return async token => {
     try {
       const { payload } = await jwtVerify(token, jwks, { issuer: options.issuer, audience: options.audience,
-        algorithms: ['RS256', 'ES256'], requiredClaims: ['sub', 'exp'] });
-      return payload.sub ? { subject: payload.sub, expiresAtMs: payload.exp! * 1000 } : null;
+        algorithms: ['RS256', 'ES256'], requiredClaims: ['exp'] });
+      const scopes = typeof payload.scope === 'string' ? payload.scope.split(/\s+/).filter(Boolean) :
+        Array.isArray(payload.scp) && payload.scp.every(value => typeof value === 'string') ? payload.scp as string[] : [];
+      const clientId = typeof payload.client_id === 'string' ? payload.client_id :
+        typeof payload.azp === 'string' ? payload.azp : undefined;
+      // User tokens identify the customer; service tokens have no user sub and
+      // must carry a registered OAuth client ID instead. Never invent a subject.
+      const subject = payload.sub || (scopes.includes('mcp:service') && clientId ? `service:${clientId}` : undefined);
+      return subject ? { subject, clientId, scopes, expiresAtMs: payload.exp! * 1000 } : null;
     } catch { return null; }
   };
 }
 
 export interface ProductionMcpOptions extends StreamableHttp2025Options {
   store: SharedSessionStore;
-  authenticate: (token: string) => Promise<{ subject: string; expiresAtMs?: number } | null>;
+  authenticate: (token: string) => Promise<AuthenticatedMcpIdentity | null>;
+  /** Optional Alexa scope policy; enable it on the Alexa-facing production endpoint. */
+  scopePolicy?: { service: string; tools: string; resources: string };
+  /** Alexa+ currently does not support WWW-Authenticate challenges; set false for add-ons. */
+  sendAuthenticateChallenge?: boolean;
 }
 /** Distributed alternative to createStreamableHttp2025Guard. Requires auth on EVERY method. */
 export function createProductionMcpGuard(options: ProductionMcpOptions) {
@@ -161,18 +178,31 @@ export function createProductionMcpGuard(options: ProductionMcpOptions) {
       }
       const authorization = req.headers.authorization;
       if (typeof authorization !== 'string' || !/^Bearer [^\s]+$/.test(authorization)) {
-        res.setHeader('WWW-Authenticate', 'Bearer'); jsonRpcHttpError(res, 401, 'Bearer token required'); return;
+        if (options.sendAuthenticateChallenge !== false) res.setHeader('WWW-Authenticate', 'Bearer');
+        jsonRpcHttpError(res, 401, 'Bearer token required'); return;
       }
       const identity = await authenticate(authorization.slice(7));
       if (!identity?.subject) {
-        res.setHeader('WWW-Authenticate', 'Bearer error="invalid_token"');
+        if (options.sendAuthenticateChallenge !== false) res.setHeader('WWW-Authenticate', 'Bearer error="invalid_token"');
         jsonRpcHttpError(res, 401, 'Invalid bearer token'); return;
       }
       const version = req.headers['mcp-protocol-version'] ?? LEGACY_PROTOCOL_VERSION;
       if (typeof version !== 'string' || !supported.includes(version)) {
         jsonRpcHttpError(res, 400, 'Unsupported MCP-Protocol-Version'); return;
       }
-      const isInitialize = req.method === 'POST' && req.body?.method === 'initialize';
+      const method = req.method === 'POST' ? req.body?.method : undefined;
+      if (options.scopePolicy && req.method === 'POST') {
+        const policy = options.scopePolicy;
+        const scopes = identity.scopes ?? [];
+        const authorized = method === 'initialize' || method === 'tools/list' || method === 'ping'
+          ? [policy.service, policy.tools, policy.resources].some(scope => scopes.includes(scope))
+          : method === 'tools/call' ? scopes.includes(policy.tools)
+          : method === 'resources/read' ? scopes.includes(policy.resources)
+          : method === 'resources/list' ? [policy.service, policy.resources].some(scope => scopes.includes(scope))
+          : true; // Unknown methods are handled by application JSON-RPC dispatch.
+        if (!authorized) { jsonRpcHttpError(res, 403, 'Insufficient MCP scope'); return; }
+      }
+      const isInitialize = method === 'initialize';
       if (isInitialize) {
         const id = await store.create(identity.subject, req.body?.params?.protocolVersion ?? version);
         req.mcpSessionId = id;

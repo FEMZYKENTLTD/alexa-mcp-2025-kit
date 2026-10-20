@@ -318,4 +318,6 @@ export async function runMcp2025ComplianceAudit(targetUrl: string, options: { be
 }
 
 export { RedisSessionStore, createJwksAuthenticator, createProductionMcpGuard } from './production.js';
-export type { SharedSessionStore, RedisSessionClient, SessionRecord, StoredEvent, SessionMessage, ProductionMcpOptions, JwksAuthOptions } from './production.js';
+export type { AuthenticatedMcpIdentity, SharedSessionStore, RedisSessionClient, SessionRecord, StoredEvent, SessionMessage, ProductionMcpOptions, JwksAuthOptions } from './production.js';
+export { createAlexaProtectedResourceMetadata } from './alexa-auth.js';
+export type { AlexaProtectedResourceOptions } from './alexa-auth.js';

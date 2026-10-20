@@ -20,7 +20,8 @@
     "README.md",
     "OPEN_SOURCE_SUBMISSION.md",
     "SECURITY.md",
-    "LICENSE"
+    "LICENSE",
+    "docs"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -28,7 +29,9 @@
     "test": "npm run build && vitest run",
     "demo-audit": "npm run build && node dist/cli.js selftest",
     "reference-server": "tsx examples/reference-server.ts",
-    "check": "npm run build && npm test"
+    "check": "npm run build && npm test",
+    "build:production": "tsc -p tsconfig.production.json",
+    "production-server": "tsx examples/production-server.ts"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

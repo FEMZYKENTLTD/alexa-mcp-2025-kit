@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { createServer } from 'node:http';
+import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { randomUUID } from 'node:crypto';
 import express from 'express';
 import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import { createClient } from 'redis';
-import { createJwksAuthenticator, createProductionMcpGuard, RedisSessionStore,
+import { createAlexaProtectedResourceMetadata, createJwksAuthenticator, createProductionMcpGuard, RedisSessionStore,
   runMcp2025ComplianceAudit, type SharedSessionStore, type SessionRecord,
   type StoredEvent, type SessionMessage, MCP_2025_PROTOCOL_VERSION } from '../src/index.js';
 
@@ -49,10 +50,15 @@ class SharedTestStore implements SharedSessionStore {
   }
 }
 
-function serve(store: SharedSessionStore) {
+function serve(store: SharedSessionStore, alexaMode = false) {
   const app = express();
   app.use('/mcp', express.json(), createProductionMcpGuard({
-    store, allowedOrigins: ['http://127.0.0.1'], authenticate: async token => ['alice', 'bob'].includes(token) ? { subject: token } : null
+    store, allowedOrigins: ['http://127.0.0.1'],
+    ...(alexaMode ? { sendAuthenticateChallenge: false,
+      scopePolicy: { service: 'mcp:service', tools: 'mcp:tools', resources: 'mcp:resources' } } : {}),
+    authenticate: async token => token === 'service' ? { subject: 'service:demo', scopes: ['mcp:service'] } :
+      token === 'reader' ? { subject: 'reader', scopes: ['mcp:resources'] } :
+      ['alice', 'bob'].includes(token) ? { subject: token, scopes: ['mcp:tools', 'mcp:resources'] } : null
   }).middleware);
   app.post('/mcp', (req, res) => {
     const { id, method } = req.body;
@@ -95,6 +101,32 @@ describe('protected shared-session middleware', () => {
       expect((await post(a.url, { jsonrpc: '2.0', id: 3, method: 'ping' }, 'alice', id)).status).toBe(404);
     } finally { await a.close(); await b.close(); }
   });
+  it('protects Alexa tool calls by scope and returns 401 without an unsupported challenge header', async () => {
+    const app = await serve(new SharedTestStore(), true);
+    try {
+      const missing = await post(app.url, init);
+      expect(missing.status).toBe(401);
+      expect(missing.headers.get('www-authenticate')).toBeNull();
+      const service = await post(app.url, init, 'service');
+      const serviceId = service.headers.get('mcp-session-id')!;
+      expect(serviceId).toBeTruthy();
+      expect((await post(app.url, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, 'service', serviceId)).status).toBe(200);
+      expect((await post(app.url, { jsonrpc: '2.0', id: 3, method: 'tools/call' }, 'service', serviceId)).status).toBe(403);
+      const user = await post(app.url, init, 'alice');
+      const userId = user.headers.get('mcp-session-id')!;
+      expect((await post(app.url, { jsonrpc: '2.0', id: 4, method: 'tools/call' }, 'alice', userId)).status).toBe(200);
+      expect((await post(app.url, { jsonrpc: '2.0', id: 5, method: 'tools/call' }, 'reader', userId)).status).toBe(403);
+    } finally { await app.close(); }
+  });
+  it('constructs Alexa protected resource discovery metadata from canonical HTTPS URLs', () => {
+    expect(createAlexaProtectedResourceMetadata({
+      resourceUrl: 'https://mcp.example.com/mcp', authorizationServer: 'https://auth.example.com/'
+    })).toEqual({ resource: 'https://mcp.example.com/mcp', authorization_servers: ['https://auth.example.com/'],
+      scopes_supported: ['mcp:tools', 'mcp:resources'] });
+    expect(() => createAlexaProtectedResourceMetadata({
+      resourceUrl: 'http://mcp.example.com/mcp', authorizationServer: 'https://auth.example.com/'
+    })).toThrow();
+  });
   it('closes a live SSE stream when its session expires', async () => {
     const store = new SharedTestStore();
     const app = await serve(store);
@@ -136,6 +168,12 @@ describe('OIDC JWKS verification', () => {
       expect(await verifier(await sign('other', '15m'))).toBeNull();
       expect(await verifier(await sign('alexa-mcp', '-10s'))).toBeNull();
       expect(await verifier('invalid')).toBeNull();
+      const machineToken = await new SignJWT({ scope: 'mcp:service', client_id: 'alexa-addon' })
+        .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
+        .setIssuer('https://issuer.example').setAudience('alexa-mcp')
+        .setIssuedAt().setExpirationTime('15m').sign(privateKey);
+      expect(await verifier(machineToken)).toMatchObject({ subject: 'service:alexa-addon',
+        scopes: ['mcp:service'], clientId: 'alexa-addon' });
     } finally {
       server.closeAllConnections();
       await new Promise<void>(done => server.close(() => done()));
@@ -188,4 +226,61 @@ describe.skipIf(!redisUrl)('real Redis cross-instance and TTL integration', () =
       await expect(a.append(id, 'message', {})).rejects.toThrow();
     } finally { await a.close(); await b.close(); await client.quit(); }
   }, 10_000);
+});
+
+describe.skipIf(!redisUrl)('Alexa+ production example end-to-end', () => {
+  it('serves public PRM and enforces service/user OAuth scopes with real Redis and signed JWTs', async () => {
+    const { publicKey, privateKey } = await generateKeyPair('RS256');
+    const jwk = { ...await exportJWK(publicKey), kid: 'e2e', alg: 'RS256', use: 'sig' };
+    const jwks = createServer((_req, res) => res.end(JSON.stringify({ keys: [jwk] })));
+    jwks.listen(0, '127.0.0.1');
+    await once(jwks, 'listening');
+    const portServer = createServer();
+    portServer.listen(0, '127.0.0.1');
+    await once(portServer, 'listening');
+    const port = (portServer.address() as { port: number }).port;
+    await new Promise<void>(resolve => portServer.close(() => resolve()));
+    const child = spawn(process.execPath, ['node_modules/tsx/dist/cli.mjs', 'examples/production-server.ts'], {
+      cwd: process.cwd(), stdio: 'pipe', env: { ...process.env,
+        REDIS_URL: redisUrl, PORT: String(port), JWKS_URL: `http://127.0.0.1:${(jwks.address() as { port: number }).port}/jwks`,
+        MCP_ISSUER: 'https://issuer.example/', MCP_PUBLIC_URL: 'https://mcp.example.com/mcp',
+        MCP_AUDIENCE: 'https://mcp.example.com/mcp', MCP_ALLOWED_ORIGINS: 'https://app.example.com'
+      }
+    });
+    let log = '';
+    child.stderr.on('data', chunk => { log += chunk.toString(); });
+    const base = `http://127.0.0.1:${port}`;
+    try {
+      let ready = false;
+      for (let attempt = 0; attempt < 60 && !ready; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+        ready = await fetch(`${base}/healthz`).then(res => res.ok).catch(() => false);
+        if (child.exitCode !== null) throw new Error(`Production server exited: ${log}`);
+      }
+      expect(ready, log).toBe(true);
+      const metadata = await (await fetch(`${base}/.well-known/oauth-protected-resource`)).json();
+      expect(metadata.resource).toBe('https://mcp.example.com/mcp');
+      expect(metadata.authorization_servers).toEqual(['https://issuer.example/']);
+      expect((await post(`${base}/mcp`, init)).status).toBe(401);
+      const sign = (claims: Record<string, unknown>) => new SignJWT(claims)
+        .setProtectedHeader({ alg: 'RS256', kid: 'e2e' })
+        .setIssuer('https://issuer.example/').setAudience('https://mcp.example.com/mcp')
+        .setIssuedAt().setExpirationTime('15m').sign(privateKey);
+      const machine = await sign({ client_id: 'alexa-addon', scope: 'mcp:service' });
+      const user = await sign({ sub: 'alice', scope: 'mcp:tools mcp:resources' });
+      const serviceResponse = await post(`${base}/mcp`, init, machine);
+      const id = serviceResponse.headers.get('mcp-session-id')!;
+      expect(id).toBeTruthy();
+      expect((await post(`${base}/mcp`, { jsonrpc: '2.0', id: 2, method: 'tools/list' }, machine, id)).status).toBe(200);
+      expect((await post(`${base}/mcp`, { jsonrpc: '2.0', id: 3, method: 'tools/call', params: { name: 'show_status', arguments: { label: 'hi' } } }, machine, id)).status).toBe(403);
+      const report = await runMcp2025ComplianceAudit(`${base}/mcp`, { bearerToken: user });
+      expect(report.score, JSON.stringify(report.checks)).toBe('8/8 (100%)');
+    } finally {
+      child.kill('SIGTERM');
+      await Promise.race([once(child, 'exit'), new Promise(resolve => setTimeout(resolve, 2500))]);
+      if (child.exitCode === null) child.kill('SIGKILL');
+      jwks.closeAllConnections();
+      await new Promise<void>(resolve => jwks.close(() => resolve()));
+    }
+  }, 12_000);
 });

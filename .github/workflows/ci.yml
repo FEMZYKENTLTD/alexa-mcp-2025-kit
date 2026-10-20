@@ -35,6 +35,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - run: npm run build:production
       - run: npm test
       - run: npm run demo-audit
       - run: npm audit --audit-level=moderate

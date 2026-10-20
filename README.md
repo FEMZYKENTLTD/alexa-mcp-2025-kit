@@ -37,7 +37,7 @@ Requires Node.js **20+**.
 ```bash
 npm install
 npm run build
-npm test                         # 21 local Vitest tests + 1 Redis integration test in CI
+npm test                         # 23 local Vitest tests + 2 Redis integration tests in CI
 npm run demo-audit               # ephemeral self-test; prints table + JSON, exits 0 on 8/8
 npm run reference-server         # dashboard: http://localhost:3001/; MCP: /mcp
 ```
@@ -73,6 +73,7 @@ A failed check exits 1; invalid CLI syntax exits 2. The full JSON report include
 | --- | --- |
 | `MCP_2025_PROTOCOL_VERSION`, `LEGACY_PROTOCOL_VERSION` | `2025-11-25`, `2025-03-26` |
 | `createStreamableHttp2025Guard(options?)` | `{ middleware, createSession, hasSession, terminateSession, recordSseEvent, getEventsAfter }` |
+| `createProductionMcpGuard`, `RedisSessionStore`, `createJwksAuthenticator`, `createAlexaProtectedResourceMetadata` | Opt-in OIDC/JWKS authentication, shared Redis sessions/SSE, Alexa protected-resource discovery |
 | `defineAlexaMcpAppTool<TInput,TOutput>(definition)` | Validate and retain typed `ui://` tool definition and async handler |
 | `parseAgentSkillMarkdown(markdownContent)` | Validate YAML frontmatter and instructions; return `AgentSkillManifest` |
 | `loadAgentSkillManifest(filePath)` | Read and parse a `SKILL.md` file |
@@ -125,9 +126,11 @@ The auditor checks: (1) Origin 403, (2) initialize/version negotiation, (3) sess
 
 ## Continuous verification and security
 
-CI runs `npm ci`, build, all 22 tests (including a real Redis service), the 8/8 demo, npm audit, and a package dry-run on Node 20 and 22. Development dependencies were updated to Vitest 4 to resolve critical and moderate npm audit findings while retaining Node 20 support. See [SECURITY.md](SECURITY.md) for responsible disclosure and production boundaries.
+CI runs `npm ci`, build, all 25 tests (including a real Redis service), the 8/8 demo, npm audit, and a package dry-run on Node 20 and 22. Development dependencies were updated to Vitest 4 to resolve critical and moderate npm audit findings while retaining Node 20 support. See [SECURITY.md](SECURITY.md) for responsible disclosure and production boundaries.
 
 ## Production deployment: OIDC authentication and shared expiring Redis sessions
+
+**For the full Alexa account-linking and GitHub-to-GHCR deployment checklist, see [docs/ALEXA_DEPLOYMENT.md](docs/ALEXA_DEPLOYMENT.md).** GitHub Actions builds/publishes a container image after merging to `main`; GitHub Pages cannot host a Node/Redis/OAuth MCP server. A separate HTTPS container host, Redis provider, OAuth provider, DNS and developer account configuration are required.
 
 The default `createStreamableHttp2025Guard()` is intentionally **local/in-memory** and preserves the original synchronous API. For multi-instance production, use the separate async `createProductionMcpGuard({ store, authenticate, allowedOrigins })` instead. This is an opt-in addition, not a breaking change to the primary project. It requires an **explicit Origin allowlist** and a valid Bearer token on **POST, GET, and DELETE**, checks the Origin first, binds every session to the verified JWT `sub`, and returns `401` on missing/invalid credentials or `403` when a different subject attempts to use an existing session. A Redis outage fails closed with `503`. The Redis store uses atomic Lua operations to allocate per-session SSE IDs, bound replay history, Redis Pub/Sub for cross-instance live delivery, and a fixed session TTL (30 minutes by default); DELETE revokes sessions across instances. Open SSE connections close when either the JWT or session expires. No signing keys, credentials, or Redis instance are bundled with the package.
 
@@ -154,9 +157,9 @@ const guard = createProductionMcpGuard({
 
 `createJwksAuthenticator` verifies RS256/ES256 JWT signatures against an HTTPS OIDC JWKS, requires `sub` and `exp`, and checks issuer and audience. Localhost HTTP JWKS is permitted for testing only. Session IDs are *not* credentials; the Bearer token must be checked on every request. Redis client connections should use TLS and credentials/ACLs and be kept on a private network. Front the app with HTTPS, an authenticating identity provider, rate limiting, and operational monitoring. If using another trusted authenticator, provide an async `(token) => ({ subject, expiresAtMs }) | null` function; include `expiresAtMs` to bound long-lived SSE streams. Do not pass an unauthenticated user-supplied subject. Store TTL is fixed from initialization (not sliding), up to 24 hours. A crashed Redis instance requires your own persistence/HA configuration.
 
-**Runnable production example:** [`examples/production-server.ts`](examples/production-server.ts) requires `REDIS_URL`, `JWKS_URL`, `MCP_ISSUER`, `MCP_AUDIENCE`, and comma-separated HTTPS `MCP_ALLOWED_ORIGINS`; set these through your secret manager and run `npx tsx examples/production-server.ts`. To audit a protected endpoint, set `MCP_AUDIT_BEARER_TOKEN` in the environment and run `node dist/cli.js audit https://your-host.example/mcp`. The auditor does not print the token and refuses redirects, rather than forwarding credentials to an unexpected destination. The selftest still runs without credentials against the local reference server. `REDIS_URL=redis://127.0.0.1:6379 npm test` also runs the Redis integration test; without Redis it is skipped locally and always runs in CI.
+**Runnable production example:** [`examples/production-server.ts`](examples/production-server.ts) requires `REDIS_URL`, `JWKS_URL`, `MCP_ISSUER`, `MCP_PUBLIC_URL`, `MCP_AUDIENCE`, and comma-separated HTTPS `MCP_ALLOWED_ORIGINS`; set these through your secret manager and run `npx tsx examples/production-server.ts`. To audit a protected endpoint, set `MCP_AUDIT_BEARER_TOKEN` in the environment and run `node dist/cli.js audit https://your-host.example/mcp`. The auditor does not print the token and refuses redirects, rather than forwarding credentials to an unexpected destination. The selftest still runs without credentials against the local reference server. `REDIS_URL=redis://127.0.0.1:6379 npm test` also runs the Redis integration test; without Redis it is skipped locally and always runs in CI.
 
-**What “deployment boundaries” means:** a toolkit cannot supply your application's identity provider, user authorization rules, TLS termination, Redis credentials/HA, or secrets. The library now enforces JWT identity and distributed session lifecycle *when you configure its production guard*, but those external services and operational policies must exist in the environment where you deploy it. The basic development guard remains deliberately unauthenticated; never expose it as a production endpoint without an authentication layer. An 8/8 protocol score confirms the audited transport checks, **not** a complete security certification.
+**What “deployment boundaries” means:** a toolkit cannot supply your application's identity provider, user authorization rules, TLS termination, Redis credentials/HA, or secrets. The library now enforces JWT identity and distributed session lifecycle *when you configure its production guard*, but those external services and operational policies must exist in the environment where you deploy it. The Alexa production example adds public protected-resource metadata, verifies service and user JWT scopes, and uses Alexa-compatible 401 responses. See the deployment checklist for the external OAuth authorization server and Alexa CLI setup. The basic development guard remains deliberately unauthenticated; never expose it as a production endpoint without an authentication layer. An 8/8 protocol score confirms the audited transport checks, **not** a complete security certification.
 
 ## License
 
