@@ -3,6 +3,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Tool, CallToolResult } from '@modelcontextprotocol/sdk/types.js';
 import { createStreamableHttp2025Guard, defineAlexaMcpAppTool, MCP_2025_PROTOCOL_VERSION } from './index.js';
+import { DEFAULT_ALLOWED_ORIGINS, originAllowed, jsonRpcHttpError } from './http-security.js';
 
 /** Start a disposable MCP reference endpoint; close() releases the listener. */
 export async function startReferenceServer(port = 0, host = '127.0.0.1'): Promise<{ url: string; server: Server; close: () => Promise<void> }> {
@@ -23,8 +24,19 @@ export async function startReferenceServer(port = 0, host = '127.0.0.1'): Promis
   app.get('/', (_req, res) => {
     res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><title>MCP 2025 Reference Server</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>body{font:16px system-ui;background:#111827;color:#f9fafb;max-width:720px;margin:10vh auto;padding:2rem}code{color:#34d399}.card{border:1px solid #374151;border-radius:16px;padding:24px;background:#1f2937}dt{color:#9ca3af}dd{margin:0 0 1rem}</style></head><body><div class="card"><h1>Alexa MCP 2025 Kit</h1><p id="health">Checking live server status…</p><dl><dt>Transport</dt><dd><code>POST /mcp · GET /mcp · DELETE /mcp</code></dd><dt>Protocol</dt><dd><code>2025-11-25</code></dd><dt>Example MCP App</dt><dd><code>show_status → ui://status/card</code></dd></dl><p>Run <code>npm run demo-audit</code> for an eight-check self-test.</p></div><script>async function update(){try{const r=await fetch('/health');const h=await r.json();document.querySelector('#health').textContent='● '+h.status+' · uptime '+h.uptimeSeconds+'s'}catch{document.querySelector('#health').textContent='● unavailable'}}update();setInterval(update,10000)</script></body></html>`);
   });
-  // Body parsing precedes the guard so it can classify JSON-RPC notifications.
-  app.use('/mcp', express.json({ limit: '1mb' }), guard.middleware);
+  // Origin must be rejected before parsing: even malformed/oversized JSON from an
+  // untrusted site receives the spec-required 403 instead of a parser error.
+  app.use('/mcp', (req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin !== undefined && !originAllowed(origin, DEFAULT_ALLOWED_ORIGINS)) {
+      jsonRpcHttpError(res, 403, 'Forbidden Origin'); return;
+    }
+    next();
+  }, express.json({ limit: '1mb' }), guard.middleware);
+  app.use('/mcp', (error: unknown, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!error) { next(); return; }
+    jsonRpcHttpError(res, 400, 'Invalid JSON request body');
+  });
   app.post('/mcp', async (req, res) => {
     const { id, method, params } = req.body ?? {};
     const send = (result: unknown) => res.json({ jsonrpc: '2.0', id, result });

@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { parseDocument } from 'yaml';
+import { DEFAULT_ALLOWED_ORIGINS, originAllowed, jsonRpcHttpError } from './http-security.js';
 
 export const MCP_2025_PROTOCOL_VERSION = '2025-11-25';
 export const LEGACY_PROTOCOL_VERSION = '2025-03-26';
@@ -55,25 +56,6 @@ export interface ComplianceAuditReport {
 }
 
 type Session = { streamId: string; nextSequence: number; events: { id: string; formatted: string }[]; clients: Set<any> };
-const jsonError = (res: any, status: number, message: string): void => {
-  res.statusCode = status;
-  res.setHeader('Content-Type', 'application/json');
-  res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: status === 403 ? -32000 : -32600, message } }));
-};
-const originAllowed = (origin: string, patterns: (string | RegExp)[]): boolean => {
-  let url: URL;
-  try {
-    url = new URL(origin);
-    if (!['http:', 'https:'].includes(url.protocol) || url.origin !== origin || url.username || url.password) return false;
-  } catch { return false; }
-  return patterns.some(pattern => {
-    if (pattern instanceof RegExp) { pattern.lastIndex = 0; return pattern.test(origin); }
-    if (pattern === '*.e2b.app') return url.hostname.endsWith('.e2b.app') && url.hostname !== '.e2b.app';
-    if (pattern.includes('://')) return origin === pattern;
-    return url.hostname.toLowerCase() === pattern.toLowerCase();
-  });
-};
-
 /** Mount on /mcp after express.json(). The application remains responsible for JSON-RPC request dispatch. */
 export function createStreamableHttp2025Guard(options: StreamableHttp2025Options = {}): {
   middleware: (req: any, res: any, next: () => void) => void;
@@ -84,7 +66,7 @@ export function createStreamableHttp2025Guard(options: StreamableHttp2025Options
   getEventsAfter: (sessionId: string, lastEventId: string) => string[];
 } {
   const sessions = new Map<string, Session>();
-  const allowed = options.allowedOrigins ?? ['localhost', '127.0.0.1', '*.e2b.app'];
+  const allowed = options.allowedOrigins ?? DEFAULT_ALLOWED_ORIGINS;
   const supported = options.supportedVersions ?? [MCP_2025_PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION];
   const createSession = (): string => {
     const id = randomUUID();
@@ -120,51 +102,58 @@ export function createStreamableHttp2025Guard(options: StreamableHttp2025Options
   const middleware = (req: any, res: any, next: () => void): void => {
     const origin = req.headers.origin;
     if (origin !== undefined && (typeof origin !== 'string' || !originAllowed(origin, allowed))) {
-      jsonError(res, 403, 'Forbidden Origin'); return;
+      jsonRpcHttpError(res, 403, 'Forbidden Origin'); return;
     }
     const method = req.method;
-    if (!['POST', 'GET', 'DELETE'].includes(method)) { res.setHeader('Allow', 'POST, GET, DELETE'); jsonError(res, 405, 'Method not allowed'); return; }
+    if (!['POST', 'GET', 'DELETE'].includes(method)) { res.setHeader('Allow', 'POST, GET, DELETE'); jsonRpcHttpError(res, 405, 'Method not allowed'); return; }
     const isInitialize = method === 'POST' && req.body?.method === 'initialize';
     const version = req.headers['mcp-protocol-version'] ?? LEGACY_PROTOCOL_VERSION;
-    if (typeof version !== 'string' || !supported.includes(version)) { jsonError(res, 400, 'Unsupported MCP-Protocol-Version'); return; }
+    if (typeof version !== 'string' || !supported.includes(version)) { jsonRpcHttpError(res, 400, 'Unsupported MCP-Protocol-Version'); return; }
     const sessionId = req.headers['mcp-session-id'];
     if (isInitialize) {
       // A session is reserved for the initialize response. Applications should only send a
       // successful InitializeResult with this header; discard the session on error.
       const id = createSession();
       req.mcpSessionId = id;
-      req.mcpProtocolVersion = version;
+      req.mcpProtocolVersion = supported.includes(req.body?.params?.protocolVersion)
+        ? req.body.params.protocolVersion : version;
       res.setHeader('MCP-Session-Id', id);
+      // Reserve the session but expose it only on a successful InitializeResult.
+      // Express res.json() calls end() with a serialized body; Node handlers may
+      // pass a Buffer. Both forms must be checked before response headers flush.
       const originalEnd = res.end;
       res.end = function (chunk: any, ...args: any[]) {
-        let successful = res.statusCode < 400;
-        if (chunk && typeof chunk === 'string' && !res.headersSent) {
-          try { successful = successful && !!JSON.parse(chunk)?.result?.protocolVersion; }
-          catch { successful = false; }
-        }
+        let successful = false;
+        try {
+          const result = JSON.parse(Buffer.isBuffer(chunk) ? chunk.toString('utf8') : chunk);
+          successful = res.statusCode >= 200 && res.statusCode < 300 &&
+            result?.jsonrpc === '2.0' && result.id === req.body.id &&
+            supported.includes(result?.result?.protocolVersion);
+        } catch { /* Invalid or empty initialize response: discard session. */ }
         if (!successful) {
           if (!res.headersSent) res.removeHeader('MCP-Session-Id');
           terminateSession(id);
         }
         return originalEnd.call(this, chunk, ...args);
       };
+      res.once('close', () => { if (!res.writableFinished) terminateSession(id); });
       next(); return;
     }
     if (options.requireSessionId !== false) {
-      if (typeof sessionId !== 'string' || !sessionId) { jsonError(res, 400, 'MCP-Session-Id required'); return; }
-      if (!sessions.has(sessionId)) { jsonError(res, 404, 'MCP session not found'); return; }
+      if (typeof sessionId !== 'string' || !sessionId) { jsonRpcHttpError(res, 400, 'MCP-Session-Id required'); return; }
+      if (!sessions.has(sessionId)) { jsonRpcHttpError(res, 404, 'MCP session not found'); return; }
     } else if (sessionId !== undefined && (typeof sessionId !== 'string' || !sessions.has(sessionId))) {
-      jsonError(res, 404, 'MCP session not found'); return;
+      jsonRpcHttpError(res, 404, 'MCP session not found'); return;
     }
     req.mcpSessionId = sessionId ?? '';
     req.mcpProtocolVersion = version;
     if (method === 'DELETE') {
-      if (typeof sessionId !== 'string' || !terminateSession(sessionId)) { jsonError(res, 404, 'MCP session not found'); return; }
+      if (typeof sessionId !== 'string' || !terminateSession(sessionId)) { jsonRpcHttpError(res, 404, 'MCP session not found'); return; }
       res.statusCode = 204; res.end(); return;
     }
     if (method === 'GET') {
-      if (!req.headers.accept?.includes('text/event-stream')) { jsonError(res, 406, 'Accept: text/event-stream required'); return; }
-      if (!sessionId || options.enableSseResumption === false) { jsonError(res, 405, 'SSE not available'); return; }
+      if (!req.headers.accept?.includes('text/event-stream')) { jsonRpcHttpError(res, 406, 'Accept: text/event-stream required'); return; }
+      if (!sessionId || options.enableSseResumption === false) { jsonRpcHttpError(res, 405, 'SSE not available'); return; }
       const session = sessions.get(sessionId)!;
       res.statusCode = 200;
       res.setHeader('Content-Type', 'text/event-stream');
@@ -237,15 +226,17 @@ export function loadAgentSkillManifest(filePath: string): AgentSkillManifest {
 }
 
 /** Probe a live MCP endpoint. Failed network checks are reported, not thrown. */
-export async function runMcp2025ComplianceAudit(targetUrl: string): Promise<ComplianceAuditReport> {
+export async function runMcp2025ComplianceAudit(targetUrl: string, options: { bearerToken?: string } = {}): Promise<ComplianceAuditReport> {
   const target = new URL(targetUrl);
   if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Audit target must be an HTTP(S) URL');
   const started = Date.now();
   const checks: ComplianceCheckItem[] = [];
   let sessionId = '';
-  const common = { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json' };
+  const common = { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json',
+    ...(options.bearerToken ? { Authorization: `Bearer ${options.bearerToken}` } : {}) };
   const request = (method: string, body?: unknown, headers: Record<string, string> = {}) =>
-    fetch(target, { method, headers: { ...common, ...headers }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5000) });
+    fetch(target, { method, headers: { ...common, ...headers }, body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: 'error', signal: AbortSignal.timeout(5000) });
   const rpc = (id: number, method: string, params?: unknown) => ({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) });
   async function check(id: string, name: string, specSection: string, fn: () => Promise<{ passed: boolean; statusCode?: number; details: string }>) {
     const begin = performance.now();
@@ -325,3 +316,8 @@ export async function runMcp2025ComplianceAudit(targetUrl: string): Promise<Comp
     overallPassed: passed === checks.length, score: `${passed}/${checks.length} (${Math.round(100 * passed / checks.length)}%)`,
     totalLatencyMs: Date.now() - started, checks };
 }
+
+export { RedisSessionStore, createJwksAuthenticator, createProductionMcpGuard } from './production.js';
+export type { AuthenticatedMcpIdentity, SharedSessionStore, RedisSessionClient, SessionRecord, StoredEvent, SessionMessage, ProductionMcpOptions, JwksAuthOptions } from './production.js';
+export { createAlexaProtectedResourceMetadata } from './alexa-auth.js';
+export type { AlexaProtectedResourceOptions } from './alexa-auth.js';

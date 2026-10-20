@@ -31,7 +31,8 @@ export async function main(args: string[] = process.argv.slice(2)): Promise<numb
       reference = await startReferenceServer();
       console.log(`Started ephemeral reference server at ${reference.url}`);
     }
-    const report = await runMcp2025ComplianceAudit(reference?.url ?? maybeUrl!);
+    const report = await runMcp2025ComplianceAudit(reference?.url ?? maybeUrl!,
+      !reference && process.env.MCP_AUDIT_BEARER_TOKEN ? { bearerToken: process.env.MCP_AUDIT_BEARER_TOKEN } : {});
     printScorecard(report);
     return report.overallPassed ? 0 : 1;
   } catch (error) {
