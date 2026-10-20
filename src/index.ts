@@ -226,15 +226,17 @@ export function loadAgentSkillManifest(filePath: string): AgentSkillManifest {
 }
 
 /** Probe a live MCP endpoint. Failed network checks are reported, not thrown. */
-export async function runMcp2025ComplianceAudit(targetUrl: string): Promise<ComplianceAuditReport> {
+export async function runMcp2025ComplianceAudit(targetUrl: string, options: { bearerToken?: string } = {}): Promise<ComplianceAuditReport> {
   const target = new URL(targetUrl);
   if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Audit target must be an HTTP(S) URL');
   const started = Date.now();
   const checks: ComplianceCheckItem[] = [];
   let sessionId = '';
-  const common = { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json' };
+  const common = { Accept: 'application/json, text/event-stream', 'Content-Type': 'application/json',
+    ...(options.bearerToken ? { Authorization: `Bearer ${options.bearerToken}` } : {}) };
   const request = (method: string, body?: unknown, headers: Record<string, string> = {}) =>
-    fetch(target, { method, headers: { ...common, ...headers }, body: body === undefined ? undefined : JSON.stringify(body), signal: AbortSignal.timeout(5000) });
+    fetch(target, { method, headers: { ...common, ...headers }, body: body === undefined ? undefined : JSON.stringify(body),
+      redirect: 'error', signal: AbortSignal.timeout(5000) });
   const rpc = (id: number, method: string, params?: unknown) => ({ jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) });
   async function check(id: string, name: string, specSection: string, fn: () => Promise<{ passed: boolean; statusCode?: number; details: string }>) {
     const begin = performance.now();
@@ -314,3 +316,6 @@ export async function runMcp2025ComplianceAudit(targetUrl: string): Promise<Comp
     overallPassed: passed === checks.length, score: `${passed}/${checks.length} (${Math.round(100 * passed / checks.length)}%)`,
     totalLatencyMs: Date.now() - started, checks };
 }
+
+export { RedisSessionStore, createJwksAuthenticator, createProductionMcpGuard } from './production.js';
+export type { SharedSessionStore, RedisSessionClient, SessionRecord, StoredEvent, SessionMessage, ProductionMcpOptions, JwksAuthOptions } from './production.js';
